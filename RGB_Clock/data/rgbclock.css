@@ -1,0 +1,10 @@
+body {
+    background-color: #ccc;
+    font-family: sans-serif;
+}
+
+iframe.simulation {
+    border: none;
+    height: 150px;
+    width: 350px;
+}
