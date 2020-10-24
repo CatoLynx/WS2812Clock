@@ -45,7 +45,8 @@ enum ControlSource {
 
 #define LDR_PIN A0
 #define DATA_PIN 13
-#define NUM_LEDS 84
+#define LEDS_PER_SEGMENT 3
+#define NUM_LEDS (4 * 7 * LEDS_PER_SEGMENT)
 
 // Mapping of indexes to segment combinations. This is the link between SEG_BUF and DIG_BUF.
 const byte SEG_CONF[12] = {
@@ -488,8 +489,8 @@ unsigned long applyBrightness(unsigned long color) {
 
 void setSegmentColor(byte digit, byte segment, unsigned long color) {
   byte segmentIndex = getSegmentIndex(segment);
-  byte startPos = digit * 21 + segmentIndex * 3;
-  for (byte i = 0; i < 3; i++) {
+  byte startPos = digit * (7 * LEDS_PER_SEGMENT) + segmentIndex * LEDS_PER_SEGMENT;
+  for (byte i = 0; i < LEDS_PER_SEGMENT; i++) {
     pixels.setPixelColor(startPos + i, applyBrightness(color));
   }
 }
