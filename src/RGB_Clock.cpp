@@ -1,24 +1,9 @@
 /*
    WS2812 RGB Digital Clock for ESP8266
-   (C) 2016 Julian Metzler
+   (C) 2016-2020 Julian Metzler
 */
 
-/*
-   UPLOAD SETTINGS
-
-   Board: Generic ESP8266 Module
-   Flash Mode: DIO
-   Flash Size: 1M
-   SPIFFS Size: 256K
-   Debug port: Disabled
-   Debug Level: None
-   Reset Method: ck
-   Flash Freq: 40 MHz
-   CPU Freq: 80 MHz
-   Upload Speed: 115200
-*/
-
-#include <TimeLib.h>
+#include <TimeLib.h> // https://github.com/PaulStoffregen/Time
 #include <NtpClientLib.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -27,8 +12,10 @@
 #include <FS.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
-
 #include <Adafruit_NeoPixel.h>
+#include <PubSubClient.h> // MQTT_MAX_PACKET_SIZE needs to be increased from the default for Home Assistant discovery to work
+
+#include "settings.h"
 
 /*
    TYPEDEFS
@@ -45,6 +32,11 @@ struct ColorMap {
   ColorMapType mapType;
   const unsigned long* cMap;
   byte numColors;
+};
+
+enum ControlSource {
+  CS_STANDALONE,
+  CS_MQTT,
 };
 
 /*
@@ -116,6 +108,13 @@ unsigned long cMapValuesCustom2[4] = {
   0xFFFFFF, // Digit 4
 };
 
+unsigned long cMapValuesMQTT[4] = {
+  0xFFFFFF, // Digit 1
+  0xFFFFFF, // Digit 2
+  0xFFFFFF, // Digit 3
+  0xFFFFFF, // Digit 4
+};
+
 const ColorMap cmAllWhite = {MT_DIG_POSITION, cMapValuesAllWhite, 4};
 const ColorMap cmDigitPosition = {MT_DIG_POSITION, cMapValuesDigitPosition, 4};
 const ColorMap cmDigitValue = {MT_DIG_VALUE, cMapValuesDefault, 12};
@@ -123,6 +122,7 @@ const ColorMap cmSegmentPosition = {MT_SEG_POSITION, cMapValuesDefault, 12};
 const ColorMap cmSegmentRandom = {MT_SEG_RANDOM, cMapValuesDefault, 12};
 const ColorMap cmCustom1 = {MT_DIG_POSITION, cMapValuesCustom1, 4};
 const ColorMap cmCustom2 = {MT_DIG_POSITION, cMapValuesCustom2, 4};
+const ColorMap cmMQTT = {MT_DIG_POSITION, cMapValuesMQTT, 4};
 
 const ColorMap* COLOR_MAPS[7] = {
   &cmAllWhite,
@@ -138,10 +138,8 @@ const ColorMap* COLOR_MAPS[7] = {
    GLOBAL VARIABLES
 */
 
-const char* ssid = "";
-const char* password = "";
-
 WiFiClient client;
+PubSubClient mqttClient(client);
 ESP8266WebServer server(80);
 
 Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
@@ -164,6 +162,7 @@ int curTime = 0;
 byte curBrightness = 255;
 byte dayBrightness = 255;
 byte nightBrightness = 64;
+byte mqttBrightness = 255;
 
 // The selected colormap
 byte curColorMapId = 0;
@@ -182,6 +181,17 @@ bool nightMode = false;
 // 1 - Force night (0) or day (1) mode
 // 2 - Force until next switch (0) or permanently (1)
 byte forceMode = 0x00;
+
+// Control source
+ControlSource ctrlSrc = CS_STANDALONE;
+
+// MQTT variables
+#define MQTT_PAYLOAD_ARR_LEN 256
+char mqttPayload[MQTT_PAYLOAD_ARR_LEN] = {0x00};
+bool mqttOnState = true;
+unsigned long mqttColorR = 255;
+unsigned long mqttColorG = 255;
+unsigned long mqttColorB = 255;
 
 /*
    CONFIGURATION SAVE & RECALL (EEPROM)
@@ -219,6 +229,7 @@ void saveConfiguration() {
   EEPROMWriteInt(0, nightModeStartTime);
   EEPROMWriteInt(2, nightModeEndTime);
   EEPROMWriteByte(4, forceMode);
+  EEPROMWriteByte(5, ctrlSrc);
 
   EEPROMWriteByte(10, dayColorMapId);
   EEPROMWriteByte(11, dayBrightness);
@@ -243,6 +254,7 @@ void loadConfiguration() {
   nightModeStartTime = EEPROMReadInt(0);
   nightModeEndTime = EEPROMReadInt(2);
   forceMode = EEPROMReadByte(4);
+  ctrlSrc = (ControlSource)EEPROMReadByte(5);
 
   dayColorMapId = EEPROMReadByte(10);
   dayBrightness = EEPROMReadByte(11);
@@ -293,24 +305,153 @@ bool timeInRange(int time, int rangeStart, int rangeEnd) {
 }
 
 void updateCurrentMode() {
-  bool shouldBeNightMode = timeInRange(curTime, nightModeStartTime, nightModeEndTime);
-  if (forceMode & 1) {
-    // Forcing enabled
-    nightMode = !(forceMode & 2);
-    if (!(forceMode & 4)) {
-      // Temporary forcing
-      if (nightMode == shouldBeNightMode) {
-        // Disable forcing if we are in the right time again
-        forceMode &= ~1;
-      }
+  switch(ctrlSrc) {
+    case CS_MQTT: {
+      nightMode = false;
+      curBrightness = mqttOnState ? mqttBrightness : 0;
+      curColorMap = &cmMQTT;
+      break;
     }
-  } else {
-    // No forcing
-    nightMode = shouldBeNightMode;
+
+    default:
+    case CS_STANDALONE: {
+      bool shouldBeNightMode = timeInRange(curTime, nightModeStartTime, nightModeEndTime);
+      if (forceMode & 1) {
+        // Forcing enabled
+        nightMode = !(forceMode & 2);
+        if (!(forceMode & 4)) {
+          // Temporary forcing
+          if (nightMode == shouldBeNightMode) {
+            // Disable forcing if we are in the right time again
+            forceMode &= ~1;
+          }
+        }
+      } else {
+        // No forcing
+        nightMode = shouldBeNightMode;
+      }
+      curBrightness = nightMode ? nightBrightness : dayBrightness;
+      curColorMap = nightMode ? nightColorMap : dayColorMap;
+      curColorMapId = nightMode ? nightColorMapId : dayColorMapId;
+      break;
+    }
   }
-  curBrightness = nightMode ? nightBrightness : dayBrightness;
-  curColorMap = nightMode ? nightColorMap : dayColorMap;
-  curColorMapId = nightMode ? nightColorMapId : dayColorMapId;
+}
+
+int str2int(char* str, int len) {
+  int i;
+  int ret = 0;
+  for (i = 0; i < len; ++i)
+  {
+    ret = ret * 10 + (str[i] - '0');
+  }
+  return ret;
+}
+
+/*
+   MQTT FUNCTIONS
+*/
+
+void mqttConnect() {
+  while (!mqttClient.connected()) {
+    if (mqttClient.connect(MQTT_UID, MQTT_USER, MQTT_PASSWORD)) {
+      mqttClient.subscribe(MQTT_TOPIC_SET);
+      mqttClient.subscribe(MQTT_TOPIC_SET_BRT);
+      mqttClient.subscribe(MQTT_TOPIC_SET_COLOR);
+    } else {
+      delay(5000);
+    }
+  }
+}
+
+void mqttSendState() {
+  mqttClient.publish(MQTT_TOPIC_STATE, mqttOnState ? "ON" : "OFF");
+}
+
+void mqttSendBrightness() {
+  memset(mqttPayload, 0x00, MQTT_PAYLOAD_ARR_LEN);
+  sprintf(mqttPayload, "%d", (int)mqttBrightness);
+  mqttClient.publish(MQTT_TOPIC_BRT, mqttPayload);
+}
+
+void mqttSendColor() {
+  memset(mqttPayload, 0x00, MQTT_PAYLOAD_ARR_LEN);
+  sprintf(mqttPayload, "%d,%d,%d", (int)mqttColorR, (int)mqttColorG, (int)mqttColorB);
+  mqttClient.publish(MQTT_TOPIC_COLOR, mqttPayload);
+}
+
+void updateAll(); // Defined further down
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, MQTT_TOPIC_SET) ==  0) {
+    if (strncmp((char*)payload, "ON", length) == 0) {
+      mqttOnState = true;
+      updateAll();
+      mqttSendState();
+    } else if (strncmp((char*)payload, "OFF", length) == 0) {
+      mqttOnState = false;
+      updateAll();
+      mqttSendState();
+    }
+  } else if (strcmp(topic, MQTT_TOPIC_SET_BRT) ==  0) {
+    mqttBrightness = (byte)str2int((char*)payload, length);
+    updateAll();
+    mqttSendBrightness();
+  } else if (strcmp(topic, MQTT_TOPIC_SET_COLOR) ==  0) {
+    memcpy(mqttPayload, (char*)payload, length);
+    mqttPayload[length] = 0x00;
+    sscanf(mqttPayload, "%d,%d,%d", &mqttColorR, &mqttColorG, &mqttColorB);
+    unsigned long color = (mqttColorR << 16) | (mqttColorG << 8) | mqttColorB;
+    cMapValuesMQTT[0] = color;
+    cMapValuesMQTT[1] = color;
+    cMapValuesMQTT[2] = color;
+    cMapValuesMQTT[3] = color;
+    updateAll();
+    mqttSendColor();
+  }
+}
+
+void mqttDiscovery() {
+  String payload;
+  payload += "{";
+  payload += "\"name\": \"";
+  payload += MQTT_DISCOVERY_NAME;
+  payload += "\",";
+  payload += "\"unique_id\": \"";
+  payload += MQTT_DISCOVERY_UID;
+  payload += "\",";
+  payload += "\"command_topic\": \"";
+  payload += MQTT_TOPIC_SET;
+  payload += "\",";
+  payload += "\"state_topic\": \"";
+  payload += MQTT_TOPIC_STATE;
+  payload += "\",";
+  payload += "\"brightness_command_topic\": \"";
+  payload += MQTT_TOPIC_SET_BRT;
+  payload += "\",";
+  payload += "\"brightness_state_topic\": \"";
+  payload += MQTT_TOPIC_BRT;
+  payload += "\",";
+  payload += "\"rgb_command_topic\": \"";
+  payload += MQTT_TOPIC_SET_COLOR;
+  payload += "\",";
+  payload += "\"rgb_state_topic\": \"";
+  payload += MQTT_TOPIC_COLOR;
+  payload += "\",";
+  payload += "\"device\": {";
+  payload += "\"name\": \"";
+  payload += MQTT_DISCOVERY_DEVICE_NAME;
+  payload += "\",";
+  payload += "\"ids\": [\"";
+  payload += MQTT_DISCOVERY_DEVICE_UID;
+  payload += "\"],";
+  payload += "\"mdl\": \"";
+  payload += MQTT_DISCOVERY_DEVICE_DESCRIPTION;
+  payload += "\",";
+  payload += "\"mf\": \"";
+  payload += MQTT_DISCOVERY_DEVICE_MANUFACTURER;
+  payload += "\"}}";
+
+  mqttClient.publish(MQTT_DISCOVERY_TOPIC, payload.c_str());
 }
 
 /*
@@ -423,6 +564,21 @@ void generateSegBuf(byte* segBuf, byte* digBuf) {
   for (byte n = 0; n < 4; n++) {
     segBuf[n] = digitToSegments(digBuf[n]);
   }
+}
+
+void displayNumber(int number) {
+  formatInteger(DIG_BUF, number, 4);
+  generateSegBuf(SEG_BUF, DIG_BUF);
+  setAllSegments(SEG_BUF);
+  updateDisplay();
+}
+
+void updateAll() {
+  updateCurrentMode();
+  formatInteger(DIG_BUF, curTime, 4);
+  generateSegBuf(SEG_BUF, DIG_BUF);
+  setAllSegments(SEG_BUF);
+  updateDisplay();
 }
 
 /*
@@ -551,6 +707,20 @@ void handleRoot() {
   page += "<label><input type='checkbox' name='force-permanent' value='true'";
   page += (forceMode & 4) ? "checked" : "";
   page += "/> Permanent</label>";
+  page += "<br />";
+  page += "<input type='submit' value='Set'/>";
+  page += "</form>";
+  page += "</div>";
+
+  page += "<div id='ctrl-src'>";
+  page += "<form action='/setctrlsrc' method='POST'>";
+  page += "<label><input type='radio' name='ctrl-src' value='standalone'";
+  page += (ctrlSrc == CS_STANDALONE) ? "checked" : "";
+  page += "/> Internal Control</label>";
+  page += "<br />";
+  page += "<label><input type='radio' name='ctrl-src' value='mqtt'";
+  page += (ctrlSrc == CS_MQTT) ? "checked" : "";
+  page += "/> MQTT Control</label>";
   page += "<br />";
   page += "<input type='submit' value='Set'/>";
   page += "</form>";
@@ -729,6 +899,20 @@ void handle_setmodeforce() {
   server.send(303, "text/plain", "");
 }
 
+void handle_setctrlsrc() {
+  if (server.arg("ctrl-src") == "standalone") {
+    ctrlSrc = CS_STANDALONE;
+  } else if (server.arg("ctrl-src") == "mqtt") {
+    ctrlSrc = CS_MQTT;
+  } else {
+    ctrlSrc = CS_STANDALONE;
+  }
+
+  saveConfiguration();
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 void handle_getsegmentcolors() {
   String page;
   unsigned long color;
@@ -772,17 +956,26 @@ void setup() {
     updateDisplay();
     delay(10);
   }
+  
+  displayNumber(-100);
+  delay(100);
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  wifi_station_set_hostname("RGB-Clock");
-  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    delay(5000);
+  WiFi.hostname("RGB-Clock");
+  WiFi.begin(STA_SSID, STA_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    displayNumber(-(WiFi.status() + 100));
+    delay(1000);
   }
 
+  displayNumber(-200);
+  delay(100);
 
   NTP.begin("pool.ntp.org", 1, true);
   NTP.setInterval(3600);
+
+  displayNumber(-300);
+  delay(100);
 
   server.onNotFound(handleNotFound);
   server.on("/", handleRoot);
@@ -794,6 +987,7 @@ void setup() {
   server.on("/setnightbrightness", handle_setnightbrightness);
   server.on("/setmodetimes", handle_setmodetimes);
   server.on("/setmodeforce", handle_setmodeforce);
+  server.on("/setctrlsrc", handle_setctrlsrc);
   server.on("/getsegmentcolors", handle_getsegmentcolors);
   server.serveStatic("/rgbclock.css", SPIFFS, "/rgbclock.css");
   server.serveStatic("/simulation.html", SPIFFS, "/simulation.html");
@@ -802,7 +996,18 @@ void setup() {
   server.serveStatic("/favicon.ico", SPIFFS, "/favicon.ico");
   server.begin();
 
+  displayNumber(-400);
+  delay(100);
+
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  displayNumber(-500);
+  delay(100);
+
   loadConfiguration();
+
+  displayNumber(-600);
 
   delay(100); // To avoid displaying 00:00 for a moment on startup
 }
@@ -812,14 +1017,24 @@ void loop() {
   ArduinoOTA.handle();
   server.handleClient();
 
+  if (!mqttClient.connected()) {
+    ArduinoOTA.handle();
+    displayNumber(-700);
+    mqttConnect();
+    delay(100);
+    displayNumber(-701);
+    mqttClient.loop();
+    delay(100);
+    displayNumber(-702);
+    mqttDiscovery();
+    delay(100);
+  }
+  mqttClient.loop();
+
   if (millis() - timeRefreshNow > 5000) {
     timeRefreshNow = millis();
     time_t now = NTP.getTime();
     curTime = hour(now) * 100 + minute(now);
-    updateCurrentMode();
-    formatInteger(DIG_BUF, curTime, 4);
-    generateSegBuf(SEG_BUF, DIG_BUF);
-    setAllSegments(SEG_BUF);
-    updateDisplay();
+    updateAll();
   }
 }
