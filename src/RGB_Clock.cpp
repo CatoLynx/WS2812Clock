@@ -972,7 +972,7 @@ void setup() {
   displayNumber(-200);
   delay(100);
 
-  NTP.begin("pool.ntp.org", 1, true);
+  NTP.begin(NTP_HOST, 1, true);
   NTP.setInterval(3600);
 
   displayNumber(-300);

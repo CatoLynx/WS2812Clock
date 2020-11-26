@@ -4,6 +4,8 @@
 #define MQTT_USER "username"
 #define MQTT_PASSWORD "password"
 
+#define NTP_HOST "pool.ntp.org"
+
 // MQTT integration is like a RGB light in Home Assistant
 #define MQTT_TOPIC_SET "home/rgb_clock/set"
 #define MQTT_TOPIC_STATE "home/rgb_clock/state"
