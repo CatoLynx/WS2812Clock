@@ -5,6 +5,7 @@
 #define MQTT_PASSWORD "password"
 
 #define NTP_HOST "pool.ntp.org"
+#define NTP_UPDATE_INTERVAL_MS 5000
 
 // MQTT integration is like a RGB light in Home Assistant
 #define MQTT_TOPIC_SET "home/rgb_clock/set"
@@ -21,6 +22,7 @@
 #define MQTT_DISCOVERY_DEVICE_UID "rgb_clock"
 #define MQTT_DISCOVERY_DEVICE_MANUFACTURER "xatLabs"
 #define MQTT_DISCOVERY_DEVICE_DESCRIPTION "7-Segment RGB clock with WS2812 LEDs"
+#define MQTT_DISCOVERY_INTERVAL_MS 60000
 
 // Variables for Station WiFi
 const char* STA_SSID = "WiFi SSID";

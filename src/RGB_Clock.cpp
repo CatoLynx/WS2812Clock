@@ -1014,6 +1014,7 @@ void setup() {
 }
 
 unsigned long timeRefreshNow = 0;
+unsigned long discoveryRefreshNow = 0;
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
@@ -1032,10 +1033,15 @@ void loop() {
   }
   mqttClient.loop();
 
-  if (millis() - timeRefreshNow > 5000) {
+  if (millis() - timeRefreshNow > NTP_UPDATE_INTERVAL_MS) {
     timeRefreshNow = millis();
     time_t now = NTP.getTime();
     curTime = hour(now) * 100 + minute(now);
     updateAll();
+  }
+
+  if (millis() - discoveryRefreshNow > MQTT_DISCOVERY_INTERVAL_MS) {
+    discoveryRefreshNow = millis();
+    mqttDiscovery();
   }
 }
